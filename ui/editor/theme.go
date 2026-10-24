@@ -45,7 +45,10 @@ type Theme struct {
 	Tokens [tokenKinds]TokenStyle
 }
 
-// TokenStyle is how a kind of token shows.
+// TokenStyle is how a kind of token shows. Italic and Bold draw its
+// glyphs in that face of the editor's font, where its regular glyphs
+// would be: in a monospaced font whose italics and bold keep its advance,
+// as code fonts' do.
 type TokenStyle struct {
 	Color  ui.Color
 	Italic bool

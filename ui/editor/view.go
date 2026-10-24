@@ -44,8 +44,11 @@ type view struct {
 	// by offset.
 	inlays []inlay
 
-	lines   lineCache
-	shaped  shapeCache
+	lines  lineCache
+	shaped shapeCache
+	// faced shapes the runs drawn in a face of their own, a cache a
+	// face, as the cache keeps one style.
+	faced   [faceCount]shapeCache
 	widths  charWidths
 	maxLine float32 // the widest line laid out, for scrolling sideways
 	wrapAt  int     // the next line to measure the wraps of
@@ -413,6 +416,9 @@ func (v *view) endFrame() {
 		}
 	}
 	v.shaped.endFrame()
+	for i := range v.faced {
+		v.faced[i].endFrame()
+	}
 }
 
 // tokens returns the tokens of line n, whose text is s, and whether they
@@ -816,20 +822,61 @@ func byteOfRune(s string, i int) int {
 	return len(s)
 }
 
+// face is what a token's style asks of its glyphs beyond their color:
+// italic, bold, or both.
+type face uint8
+
+const (
+	faceItalic face = 1 << iota
+	faceBold
+	faceCount = 4
+)
+
+func faceOf(s TokenStyle) face {
+	var f face
+	if s.Italic {
+		f |= faceItalic
+	}
+	if s.Bold {
+		f |= faceBold
+	}
+	return f
+}
+
+// faceStyle returns the view's style in the face.
+func (v *view) faceStyle(f face) text.Style {
+	s := v.style
+	if f&faceItalic != 0 {
+		s.Italic = true
+	}
+	if f&faceBold != 0 {
+		s.Weight = max(s.Weight, 700)
+	}
+	return s
+}
+
 // runColors colors a row's glyphs: the color of each run of the
-// displayed text.
+// displayed text, and its face.
 type runColors struct {
 	ends   []int // displayed bytes each run ends at
 	colors []ui.Color
+	faces  []face // none where no run has one
 }
 
 // colorsOf makes the colors of l's tokens, by displayed bytes, with
 // inlays muted.
 func (v *view) colorsOf(l *lineLayout, out *runColors) {
-	out.ends, out.colors = out.ends[:0], out.colors[:0]
+	out.ends, out.colors, out.faces = out.ends[:0], out.colors[:0], out.faces[:0]
+	faced := false
 	for _, t := range l.toks {
 		out.ends = append(out.ends, l.toDisp(t.End, false))
 		out.colors = append(out.colors, v.theme.TokenColor(t.Kind))
+		f := faceOf(v.theme.Tokens[t.Kind])
+		out.faces = append(out.faces, f)
+		faced = faced || f != 0
+	}
+	if !faced {
+		out.faces = out.faces[:0]
 	}
 	for i, sg := range l.segs {
 		if sg.kind == segInlay {
@@ -838,42 +885,53 @@ func (v *view) colorsOf(l *lineLayout, out *runColors) {
 	}
 }
 
-// overlay colors displayed bytes a to b c.
+// overlay colors displayed bytes a to b c, in no face.
 func (cc *runColors) overlay(a, b int, c ui.Color) {
 	if a >= b {
 		return
 	}
 	var ends []int
 	var colors []ui.Color
-	add := func(e int, c ui.Color) {
+	var faces []face
+	add := func(e int, c ui.Color, f face) {
 		if n := len(ends); n > 0 && ends[n-1] >= e {
 			return
 		}
 		ends, colors = append(ends, e), append(colors, c)
+		if len(cc.faces) > 0 {
+			faces = append(faces, f)
+		}
 	}
 	prev := 0
 	for i, e := range cc.ends {
-		col := cc.colors[i]
+		col, f := cc.colors[i], cc.faceOf(i)
 		if e <= a || prev >= b {
-			add(e, col)
+			add(e, col, f)
 		} else {
 			if prev < a {
-				add(a, col)
+				add(a, col, f)
 			}
-			add(min(e, b), c)
+			add(min(e, b), c, 0)
 			if e > b {
-				add(e, col)
+				add(e, col, f)
 			}
 		}
 		prev = e
 	}
 	if prev < b {
 		if prev < a {
-			add(a, ui.Color{})
+			add(a, ui.Color{}, 0)
 		}
-		add(b, c)
+		add(b, c, 0)
 	}
-	cc.ends, cc.colors = ends, colors
+	cc.ends, cc.colors, cc.faces = ends, colors, faces
+}
+
+func (cc *runColors) faceOf(run int) face {
+	if run < len(cc.faces) {
+		return cc.faces[run]
+	}
+	return 0
 }
 
 func (cc *runColors) at(d int, def ui.Color) ui.Color {
@@ -884,12 +942,30 @@ func (cc *runColors) at(d int, def ui.Color) ui.Color {
 	return def
 }
 
+// faceAt returns the face of displayed byte d.
+func (cc *runColors) faceAt(d int) face {
+	if len(cc.faces) == 0 {
+		return 0
+	}
+	return cc.faceOf(sort.SearchInts(cc.ends, d+1))
+}
+
 // paintRow paints the glyphs of row r of l, its start at x and its top at
-// y, colored by cc, or by override when given.
+// y, colored by cc, or by override when given. The runs in a face are
+// laid out as the others, so that carets, selections and widths are the
+// regular glyphs', and drawn over their places in their face: as wide in
+// a monospaced font whose italics and bold keep its advance.
 func (v *view) paintRow(p *ui.Painter, l *lineLayout, r *rowLayout, x, y float32, cc *runColors, override func(d int, c ui.Color) ui.Color) {
 	clip := p.Visible()
 	baseline := y + (v.lineHeight-(v.ascent+v.descent))/2 + v.ascent
 	def := v.theme.Text
+	color := func(d int) ui.Color {
+		c := cc.at(d, def)
+		if override != nil {
+			c = override(d, c)
+		}
+		return c
+	}
 	for pi := range r.pieces {
 		pc := &r.pieces[pi]
 		px := x + r.indent + pc.x
@@ -901,18 +977,58 @@ func (v *view) paintRow(p *ui.Painter, l *lineLayout, r *rowLayout, x, y float32
 		if !pc.ascii {
 			bytesOf = runeBytes(l.disp[pc.from:pc.to])
 		}
+		faced := false
 		p.TextLine(lay, px, baseline, func(cluster int) ui.Color {
 			d := pc.from + cluster
 			if bytesOf != nil && cluster < len(bytesOf) {
 				d = pc.from + bytesOf[cluster]
 			}
-			c := cc.at(d, def)
-			if override != nil {
-				c = override(d, c)
+			if cc.faceAt(d) != 0 {
+				faced = true
+				return ui.Color{} // drawn in its face below
 			}
-			return c
+			return color(d)
+		})
+		if faced {
+			v.paintFaces(p, l, pc, lay, px, baseline, cc, color)
+		}
+	}
+}
+
+// paintFaces draws the runs of piece pc in a face, at the places of their
+// regular glyphs in lay.
+func (v *view) paintFaces(p *ui.Painter, l *lineLayout, pc *rowPiece, lay *text.Layout, px, baseline float32, cc *runColors, color func(d int) ui.Color) {
+	start := 0
+	for i, end := range cc.ends {
+		a, b, f := max(start, pc.from), min(end, pc.to), cc.faceOf(i)
+		start = end
+		if f == 0 || a >= b {
+			continue
+		}
+		s := l.disp[a:b]
+		fl := v.faced[f].get(s, v.faceStyle(f))
+		bytesOf := runeBytes(s)
+		p.TextLine(fl, px+clusterX(lay, utf8.RuneCountInString(l.disp[pc.from:a])), baseline, func(cluster int) ui.Color {
+			if cluster < len(bytesOf) {
+				return color(a + bytesOf[cluster])
+			}
+			return color(a)
 		})
 	}
+}
+
+// clusterX returns where the glyphs of rune r start in a layout of one
+// line.
+func clusterX(l *text.Layout, r int) float32 {
+	if len(l.Lines) == 0 {
+		return 0
+	}
+	for _, g := range l.Lines[0].Glyphs {
+		if g.Cluster >= r {
+			return g.X
+		}
+	}
+	return l.Width
 }
 
 // runeBytes returns the byte each rune of s starts at.
